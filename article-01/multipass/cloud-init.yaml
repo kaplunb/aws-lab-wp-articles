@@ -1,0 +1,125 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - apache2
+  - php
+  - php-mysql
+  - php-curl
+  - php-gd
+  - php-mbstring
+  - php-xml
+  - php-xmlrpc
+  - php-soap
+  - php-intl
+  - php-zip
+  - mysql-client
+  - unzip
+
+users:
+  - default
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+write_files:
+  - path: /etc/environment
+    append: true
+    content: |
+      DB_NAME=${db_name}
+      DB_USER=${db_user}
+      DB_PASSWORD=${db_password}
+      DB_HOST=${db_host}
+
+  - path: /etc/apache2/envvars
+    content: |
+      # Apache environment variables
+      export APACHE_RUN_USER=www-data
+      export APACHE_RUN_GROUP=www-data
+      export APACHE_PID_FILE=/var/run/apache2/apache2.pid
+      export APACHE_RUN_DIR=/var/run/apache2
+      export APACHE_LOCK_DIR=/var/lock/apache2
+      export APACHE_LOG_DIR=/var/log/apache2
+
+      # WordPress Database Configuration
+      export DB_NAME=$DB_NAME
+      export DB_USER=$DB_USER
+      export DB_PASSWORD=$DB_PASSWORD
+      export DB_HOST=$DB_HOST
+
+  - path: /etc/apache2/conf-available/servername.conf
+    permissions: '0644'
+    content: |
+      ServerName localhost
+
+  - path: /etc/apache2/sites-available/wordpress.conf
+    permissions: '0644'
+    content: |
+      <VirtualHost *:80>
+          ServerAdmin webmaster@localhost
+          DocumentRoot /var/www/wordpress
+          
+          <Directory /var/www/wordpress>
+              Options FollowSymLinks
+              AllowOverride All
+              Require all granted
+              DirectoryIndex index.php
+          </Directory>
+
+          ErrorLog ${APACHE_LOG_DIR}/error.log
+          CustomLog ${APACHE_LOG_DIR}/access.log combined
+      </VirtualHost>
+
+  - path: /usr/local/bin/install-wordpress.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      cd /tmp
+      curl -O https://wordpress.org/latest.zip
+      unzip -q latest.zip
+      mv wordpress /var/www/
+      chown -R www-data:www-data /var/www/wordpress
+      chmod -R 755 /var/www/wordpress
+
+      # Source environment variables
+      source /etc/environment
+
+      cd /var/www/wordpress
+      cat > wp-config.php <<EOF
+      <?php
+      define( 'DB_NAME', '$DB_NAME' );
+      define( 'DB_USER', '$DB_USER' );
+      define( 'DB_PASSWORD', '$DB_PASSWORD' );
+      define( 'DB_HOST', '$DB_HOST' );
+      define( 'DB_CHARSET', 'utf8' );
+      define( 'DB_COLLATE', '' );
+      
+      $(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+      
+      \$table_prefix = 'wp_';
+      define( 'WP_DEBUG', false );
+      
+      if ( ! defined( 'ABSPATH' ) ) {
+          define( 'ABSPATH', __DIR__ . '/' );
+      }
+      
+      require_once ABSPATH . 'wp-settings.php';
+      EOF
+      
+      chown www-data:www-data wp-config.php
+      chmod 640 wp-config.php
+
+runcmd:
+  - mkdir -p /var/run/apache2 /var/lock/apache2
+  - chown www-data:www-data /var/run/apache2 /var/lock/apache2
+  - systemctl stop apache2
+  - source /etc/environment
+  - bash /usr/local/bin/install-wordpress.sh
+  - a2enmod rewrite
+  - a2enconf servername
+  - a2dissite 000-default.conf
+  - a2ensite wordpress.conf
+  - apache2ctl configtest
+  - systemctl start apache2

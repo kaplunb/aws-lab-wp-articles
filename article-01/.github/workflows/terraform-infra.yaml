@@ -1,0 +1,87 @@
+name: AWS Infra Terraform Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to execute'
+        type: choice
+        required: true
+        default: 'plan'
+        options:
+          - plan
+          - apply
+          - destroy
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  TF_LOCK_TABLE: tf-state-lock-01
+  SSM_PARAM_NAME: /terraform/state-bucket-name
+  TERRAFORM_WORKING_DIR: ./terraform/01-infra
+  TF_VAR_ssh_public_key: ${{ secrets.AWS_SSH_PUBLIC_KEY }}
+
+jobs:
+  terraform:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get state bucket name
+        run: |
+          BUCKET_NAME=$(aws ssm get-parameter --name ${SSM_PARAM_NAME} --query "Parameter.Value" --output text)
+          if [ -z "$BUCKET_NAME" ]; then
+            echo "Error: State bucket name not found in SSM Parameter Store"
+            exit 1
+          fi
+          echo "TF_BUCKET=${BUCKET_NAME}" >> $GITHUB_ENV
+          echo "Using Terraform state bucket: ${BUCKET_NAME}"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        run: |
+          echo "Using bucket: ${TF_BUCKET}"
+          echo "Using table: ${TF_LOCK_TABLE}"
+          echo "Using region: ${AWS_REGION}"
+
+          terraform init \
+            -backend=true \
+            -backend-config="bucket=${TF_BUCKET}" \
+            -backend-config="dynamodb_table=${TF_LOCK_TABLE}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: Terraform Plan
+        if: github.event.inputs.action == 'plan'
+        run: |
+          echo "Starting Terraform plan..."
+          echo "Working directory contents:"
+          ls -la
+          echo "Current environment variables:"
+          env | grep TF_
+          terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        run: terraform apply -auto-approve
+
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        run: terraform destroy -auto-approve

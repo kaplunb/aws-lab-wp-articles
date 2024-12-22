@@ -1,0 +1,154 @@
+name: AWS Nuke Cleanup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  TF_LOCK_TABLE: tf-state-lock-01
+  SSM_PARAM_NAME: /terraform/state-bucket-name
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch State Bucket Name
+        id: bucket
+        run: |
+          echo "name=$(aws ssm get-parameter --name ${SSM_PARAM_NAME} \
+            --query "Parameter.Value" --output text || '')" >> $GITHUB_OUTPUT
+          echo "TF_BUCKET=$(aws ssm get-parameter --name ${SSM_PARAM_NAME} \
+            --query "Parameter.Value" --output text || '')" >> $GITHUB_ENV
+
+      - name: Create AWS Nuke config
+        if: steps.bucket.outputs.name != ''
+        run: |
+          cat << EOF > nuke-config.yml
+          regions:
+          - "${AWS_REGION}"
+
+          blocklist:
+          - "999999999999"
+
+          accounts:
+            "${{ secrets.AWS_ACCOUNT_ID }}":
+              filters:
+                IAMRole:
+                  - "github-actions-role"
+                IAMRolePolicy:
+                  - type: glob
+                    value: "github-actions-role:*"
+                IAMRolePolicyAttachment:
+                  - type: glob
+                    value: "github-actions-role -> *"
+                S3Bucket:
+                  - "${TF_BUCKET}"
+                DynamoDBTable:
+                  - "${TF_LOCK_TABLE}"
+                SecurityGroup:
+                  - property: "GroupName"
+                    value: "default"
+
+              resource-types:
+                includes:
+                  # Compute
+                  - EC2Instance
+                  - EC2Volume
+                  - EC2SecurityGroup
+                  - EC2KeyPair
+                  - AutoScalingGroup
+                  
+                  # Load Balancing
+                  - ELBv2LoadBalancer
+                  - ELBv2TargetGroup
+                  - ELBv2Listener
+                  
+                  # Storage & Database
+                  - RDSInstance
+                  - EFSFileSystem
+                  - ElastiCacheCluster
+                  
+                  # Networking
+                  - VPCEndpoint
+                  - VPCSecurityGroupRuleIngress
+                  - VPCSecurityGroupRuleEgress
+                  - VPCSecurityGroup
+                  - VPCSubnet
+                  - VPCInternetGateway
+                  - VPCRouteTable
+                  - VPCNetworkACL
+                  - VPC
+                  - NATGateway
+                  - EIPAssociation
+                  - EIP
+                  
+                  # Security & IAM
+                  - ACMCertificate
+                  - ACMCertificateValidation
+                  - IAMRole
+                  - IAMRolePolicy
+                  - IAMRolePolicyAttachment
+                  
+                  # Serverless & Events
+                  - LambdaFunction
+                  - CloudWatchEventsRule
+                  - CloudWatchEventsTarget
+                  - CloudWatchAlarm
+                  - CloudWatchLogGroup
+          EOF
+
+      - name: Install AWS Nuke
+        if: steps.bucket.outputs.name != ''
+        run: |
+          wget -q https://github.com/ekristen/aws-nuke/releases/download/v3.36.0/aws-nuke-v3.36.0-linux-amd64.tar.gz
+          tar xf aws-nuke-v3.36.0-linux-amd64.tar.gz
+          sudo mv aws-nuke /usr/local/bin/aws-nuke
+          chmod +x /usr/local/bin/aws-nuke
+
+      - name: Run AWS Nuke
+        if: steps.bucket.outputs.name != ''
+        run: aws-nuke nuke -c nuke-config.yml --force --force-sleep 3 --no-dry-run
+
+      - name: Delete S3 Object Versions
+        if: steps.bucket.outputs.name != ''
+        run: |
+          aws s3api delete-objects \
+            --bucket ${{ steps.bucket.outputs.name }} \
+            --delete "$(aws s3api list-object-versions \
+              --bucket ${{ steps.bucket.outputs.name }} \
+              --query='{Objects: Versions[].{Key:Key,VersionId:VersionId}}')" \
+            --output text || true
+
+      - name: Remove S3 Delete Markers
+        if: steps.bucket.outputs.name != ''
+        run: |
+          aws s3api delete-objects \
+            --bucket ${{ steps.bucket.outputs.name }} \
+            --delete "$(aws s3api list-object-versions \
+              --bucket ${{ steps.bucket.outputs.name }} \
+              --query='{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}')" \
+            --output text || true
+
+      - name: Delete S3 Bucket
+        if: steps.bucket.outputs.name != ''
+        run: aws s3 rb s3://${{ steps.bucket.outputs.name }}/ --force || true
+
+      - name: Delete the TF Bucket Name SSM Parameter
+        if: steps.bucket.outputs.name != ''
+        run: aws ssm delete-parameter --name ${SSM_PARAM_NAME} || true
+
+      - name: Clean DynamoDB Table
+        if: steps.bucket.outputs.name != ''
+        run: aws dynamodb delete-table --table-name ${TF_LOCK_TABLE} || true

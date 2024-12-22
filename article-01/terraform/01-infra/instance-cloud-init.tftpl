@@ -1,0 +1,170 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+packages:
+  - curl
+  - apache2
+  - php
+  - php-mysql
+  - php-curl
+  - php-gd
+  - php-mbstring
+  - php-xml
+  - php-xmlrpc
+  - php-soap
+  - php-intl
+  - php-zip
+  - mysql-client
+  - unzip
+# Docker packages
+  - docker.io
+  - docker-compose  
+
+write_files:
+  - path: /etc/environment
+    append: true
+    content: |
+      DB_NAME="${db_name}"
+      DB_USER="${db_user}"
+      DB_PASSWORD="${db_password}"
+      DB_HOST="${db_host}"
+
+  - path: /etc/apache2/envvars
+    content: |
+      # Apache environment variables
+      export APACHE_RUN_USER=www-data
+      export APACHE_RUN_GROUP=www-data
+      export APACHE_PID_FILE=/var/run/apache2/apache2.pid
+      export APACHE_RUN_DIR=/var/run/apache2
+      export APACHE_LOCK_DIR=/var/lock/apache2
+      export APACHE_LOG_DIR=/var/log/apache2
+
+      # WordPress Database Configuration
+      export DB_NAME=$DB_NAME
+      export DB_USER=$DB_USER
+      export DB_PASSWORD=$DB_PASSWORD
+      export DB_HOST=$DB_HOST
+
+  - path: /etc/apache2/conf-available/servername.conf
+    permissions: '0644'
+    content: |
+      ServerName localhost
+
+  - path: /root/docker-compose.yaml
+    permissions: '0644'
+    content: |
+      version: '3.8'
+      
+      services:
+        mysql:
+          image: mysql:8.0
+          command: --default-authentication-plugin=mysql_native_password
+          network_mode: "host"
+          restart: always
+          environment:
+            MYSQL_ROOT_PASSWORD: $${DB_PASSWORD}
+            MYSQL_DATABASE: $${DB_NAME}
+            MYSQL_USER: $${DB_USER}
+            MYSQL_PASSWORD: $${DB_PASSWORD}
+          volumes:
+            - mysql_data:/var/lib/mysql
+          deploy:
+            resources:
+              limits:
+                memory: 512M
+              reservations:
+                memory: 256M
+          healthcheck:
+            test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+            interval: 10s
+            timeout: 5s
+            retries: 5
+      
+      volumes:
+        mysql_data:
+
+  - path: /usr/local/bin/mysql-install.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      systemctl start docker
+      systemctl enable docker
+            
+      # Start MySQL and wait for it to be healthy
+      cd /root    
+      docker-compose --env-file /etc/environment up -d
+      while ! docker-compose ps | grep -q "(healthy)"; do 
+        echo "Waiting for MySQL to be healthy..."
+        sleep 5
+      done
+
+  - path: /etc/apache2/sites-available/wordpress.conf
+    permissions: '0644'
+    content: |
+      <VirtualHost *:80>
+          ServerAdmin webmaster@localhost
+          DocumentRoot /var/www/wordpress
+          
+          <Directory /var/www/wordpress>
+              Options FollowSymLinks
+              AllowOverride All
+              Require all granted
+              DirectoryIndex index.php
+          </Directory>
+
+          ErrorLog /var/log/apache2/error.log
+          CustomLog /var/log/apache2/access.log combined
+      </VirtualHost>
+
+  - path: /usr/local/bin/install-wordpress.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      cd /tmp
+      curl -O https://wordpress.org/latest.zip
+      unzip -q latest.zip
+      mv wordpress /var/www/
+      chown -R www-data:www-data /var/www/wordpress
+      chmod -R 755 /var/www/wordpress
+
+      # Source environment variables
+      source /etc/environment
+
+      cd /var/www/wordpress
+      cat > wp-config.php <<EOF
+      <?php
+      define( 'DB_NAME', '$DB_NAME' );
+      define( 'DB_USER', '$DB_USER' );
+      define( 'DB_PASSWORD', '$DB_PASSWORD' );
+      define( 'DB_HOST', '$DB_HOST' );
+      define( 'DB_CHARSET', 'utf8' );
+      define( 'DB_COLLATE', '' );
+      
+      $(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+      
+      \$table_prefix = 'wp_';
+      define( 'WP_DEBUG', false );
+      
+      if ( ! defined( 'ABSPATH' ) ) {
+          define( 'ABSPATH', __DIR__ . '/' );
+      }
+      
+      require_once ABSPATH . 'wp-settings.php';
+      EOF
+      
+      chown www-data:www-data wp-config.php
+      chmod 640 wp-config.php
+
+runcmd:
+  - mkdir -p /var/run/apache2 /var/lock/apache2
+  - chown www-data:www-data /var/run/apache2 /var/lock/apache2
+  - systemctl stop apache2
+  - source /etc/environment
+  - bash /usr/local/bin/mysql-install.sh
+  - bash /usr/local/bin/install-wordpress.sh
+  - a2enmod rewrite
+  - a2enconf servername
+  - a2dissite 000-default.conf
+  - a2ensite wordpress.conf
+  - apache2ctl configtest
+  - systemctl start apache2
